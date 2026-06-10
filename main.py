@@ -5,7 +5,7 @@ import ctypes
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -118,6 +118,7 @@ class StepFailure(RuntimeError):
 
 
 CTX: Context | None = None
+RUN_STARTED_AT: float | None = None
 
 
 def set_dpi_awareness() -> None:
@@ -136,8 +137,29 @@ def require_ctx() -> Context:
     return CTX
 
 
-def log(message: str) -> None:
-    print(message, flush=True)
+def elapsed_since_start(now: float | None = None) -> float:
+    if RUN_STARTED_AT is None:
+        return 0.0
+    current = time.perf_counter() if now is None else now
+    return max(0.0, current - RUN_STARTED_AT)
+
+
+def format_log_line(message: str, wall_time: datetime, elapsed: float) -> str:
+    clock = f"{wall_time:%H:%M:%S}.{wall_time.microsecond // 1000:03d}"
+    return f"[{clock} +{elapsed:.3f}s] {message}"
+
+
+def log(message: str, *, elapsed: float | None = None) -> None:
+    measured_elapsed = elapsed_since_start() if elapsed is None else elapsed
+    print(format_log_line(message, datetime.now(), measured_elapsed), flush=True)
+
+
+def log_page_ready_timing() -> None:
+    elapsed = elapsed_since_start()
+    log(
+        f"[TIMING] 从 main.py 启动到小程序页面可操作，总耗时={elapsed:.3f}秒",
+        elapsed=elapsed,
+    )
 
 
 def fail(step: str, reason: str) -> None:
@@ -152,7 +174,8 @@ def miniprogram_url_for_weekday(weekday: int) -> str:
 
 
 def miniprogram_url_for_date(value: date) -> str:
-    return miniprogram_url_for_weekday(value.isoweekday())
+    next_weekday = value.isoweekday() % 7 + 1
+    return miniprogram_url_for_weekday(next_weekday)
 
 
 def to_rect_from_pygetwindow(window: object) -> Rect:
@@ -554,7 +577,7 @@ def send_link_message(link: str) -> tuple[np.ndarray, np.ndarray]:
 
     after = capture_fullscreen_bgr()
     save_debug_image(after, "after_link_send")
-    log(f"[OK] 已发送当天小程序链接：{link}")
+    log(f"[OK] 已发送次日小程序链接：{link}")
     return before, after
 
 
@@ -582,7 +605,7 @@ def click_sent_link(detection: Detection) -> None:
     pyautogui.click(*detection.center)
     time.sleep(1.0)
     screenshot_fullscreen("after_link_click")
-    log(f"[OK] 已点击当天小程序链接：center={detection.center}")
+    log(f"[OK] 已点击次日小程序链接：center={detection.center}")
 
 
 def crop_by_rect(image: np.ndarray, rect: Rect) -> tuple[np.ndarray, Rect]:
@@ -703,6 +726,7 @@ def wait_for_miniprogram_page() -> None:
             save_debug_image(image, "miniprogram_page", [detection])
             save_debug_image(image, "submit_button", [detection])
             log("[OK] 检测到小程序页面并锁定橙色提交区域。")
+            log_page_ready_timing()
             return
         best_image = image
         time.sleep(1.0)
@@ -747,18 +771,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--debug-mode",
         choices=("all", "failure"),
-        default="all",
-        help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 all",
+        default="failure",
+        help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 failure",
     )
     parser.add_argument("--max-wait", type=int, default=20, help="等待小程序页面最长秒数，默认 20")
-    parser.add_argument("--dry-run", action="store_true", help="只验证微信、聊天和当天链接，不发送或点击")
+    parser.add_argument("--dry-run", action="store_true", help="只验证微信、聊天和次日链接，不发送或点击")
+    parser.add_argument("--startup-probe", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    global CTX
+    global CTX, RUN_STARTED_AT
+    RUN_STARTED_AT = time.perf_counter()
     set_dpi_awareness()
     args = parse_args(argv or sys.argv[1:])
+    if args.startup_probe:
+        log("[STARTUP-PROBE] main.py 已进入 main()")
+        return 0
+
     CTX = Context(
         chat_name=args.chat_name,
         debug_dir=Path(args.debug_dir).resolve(),
@@ -770,8 +800,12 @@ def main(argv: list[str] | None = None) -> int:
 
     today = date.today()
     weekday = today.isoweekday()
+    next_weekday = weekday % 7 + 1
     link = miniprogram_url_for_date(today)
-    log(f"[INFO] 日期={today.isoformat()}，{WEEKDAY_NAMES[weekday]}，链接={link}")
+    log(
+        f"[INFO] 当前日期={today.isoformat()}，当前={WEEKDAY_NAMES[weekday]}，"
+        f"选择次日={WEEKDAY_NAMES[next_weekday]}，链接={link}"
+    )
 
     try:
         find_wechat_window()
@@ -779,7 +813,7 @@ def main(argv: list[str] | None = None) -> int:
         open_swim_chat()
         if CTX.dry_run:
             locate_chat_input_point()
-            log("[DRY-RUN] 已验证微信窗口、目标聊天、输入框和当天链接；未清空、发送或点击。")
+            log("[DRY-RUN] 已验证微信窗口、目标聊天、输入框和次日链接；未清空、发送或点击。")
             return 0
 
         before, after = send_link_message(link)
