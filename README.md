@@ -43,27 +43,32 @@ python -m pip install -r requirements.txt
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-## 手动运行 main.py
+## 创建每日计划任务
 
-安全检测微信窗口、`swim` 聊天、输入框和次日链接，不发送或点击：
+安装命令只需执行一次。安装完成后，Windows 任务计划程序会按照配置每天自动启动任务，无需每天重新创建。仅在需要修改 `TargetTime`、`WakeLeadSeconds`、任务名称或其他配置时，才需要重新执行安装命令。
 
-```powershell
-uv run python main.py --chat-name "swim" --dry-run
-```
-
-执行完整抢票流程：
+例如，让调度器每天 `23:59:00` 启动，并使 `main.py` 尽量在 `23:59:54` 开始：
 
 ```powershell
-uv run python main.py --chat-name "swim"
+powershell -ExecutionPolicy Bypass -File .\install_scheduled_task.ps1 -TargetTime "23:59:54" -WakeLeadSeconds 54
 ```
 
-主要参数：
+默认任务名为 `SwimTicketAssistant`。自定义任务名：
 
-- `--chat-name`：目标聊天名称，默认 `swim`
-- `--debug-dir`：失败截图目录，默认 `./debug`
-- `--debug-mode`：`failure` 仅在失败时保存截图，`all` 保存全部过程截图；默认 `failure`
-- `--max-wait`：等待小程序页面的最长秒数，默认 `20`
-- `--dry-run`：只验证运行环境，不发送链接和点击
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_scheduled_task.ps1 -TargetTime "23:59:54" -WakeLeadSeconds 54 -TaskName "SwimTicketAssistant"
+```
+
+重复执行安装命令会更新同名任务，不会创建重复任务。
+
+安装脚本会配置：
+
+- 每天执行一次。
+- 仅在当前用户已登录时运行，以便桌面自动化访问微信窗口。
+- 工作目录为项目目录。
+- 已有任务运行时忽略新的并发实例。
+- 不唤醒计算机。
+- 如果 Windows 错过触发时间，则尽快启动；`scheduler.py` 再根据 10 秒晚到容限决定是否继续。
 
 ## 项目组成
 
@@ -135,32 +140,28 @@ WakeLeadSeconds = 54
 
 实际页面和提交时间会受电脑性能、微信状态和网络延迟影响。应根据多次运行日志调整 `TargetTime`，而不是把单次实测耗时当作固定值。
 
-## 创建每日计划任务
 
-安装命令只需执行一次。安装完成后，Windows 任务计划程序会按照配置每天自动启动任务，无需每天重新创建。仅在需要修改 `TargetTime`、`WakeLeadSeconds`、任务名称或其他配置时，才需要重新执行安装命令。
+## 手动运行自测抢票实现 main.py
 
-例如，让调度器每天 `23:59:00` 启动，并使 `main()` 尽量在 `23:59:54` 开始：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install_scheduled_task.ps1 -TargetTime "23:59:54" -WakeLeadSeconds 54
-```
-
-默认任务名为 `SwimTicketAssistant`。自定义任务名：
+安全检测微信窗口、`swim` 聊天、输入框和次日链接，不发送或点击：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\install_scheduled_task.ps1 -TargetTime "23:59:54" -WakeLeadSeconds 54 -TaskName "SwimTicketAssistant"
+uv run python main.py --chat-name "swim" --dry-run
 ```
 
-重复执行安装命令会更新同名任务，不会创建重复任务。
+执行完整抢票流程：
 
-安装脚本会配置：
+```powershell
+uv run python main.py --chat-name "swim"
+```
 
-- 每天执行一次。
-- 仅在当前用户已登录时运行，以便桌面自动化访问微信窗口。
-- 工作目录为项目目录。
-- 已有任务运行时忽略新的并发实例。
-- 不唤醒计算机。
-- 如果 Windows 错过触发时间，则尽快启动；`scheduler.py` 再根据 10 秒晚到容限决定是否继续。
+主要参数：
+
+- `--chat-name`：目标聊天名称，默认 `swim`
+- `--debug-dir`：失败截图目录，默认 `./debug`
+- `--debug-mode`：`failure` 仅在失败时保存截图，`all` 保存全部过程截图；默认 `failure`
+- `--max-wait`：等待小程序页面的最长秒数，默认 `20`
+- `--dry-run`：只验证运行环境，不发送链接和点击
 
 ## Windows 任务计划程序
 
@@ -267,6 +268,8 @@ Get-Content .\logs\$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
 - “提交订单”只点击一次。
 
 ## 模拟自测
+
+```text
 [2026-06-10 16:53:00.228] [SCHEDULER] 目标 main.py 启动时间=2026-06-10 16:53:54，任务提前唤起=54秒，晚到容限=10.0秒
 [2026-06-10 16:53:00.229] [SCHEDULER] 项目目录=D:\Desktop\swim
 [2026-06-10 16:53:00.231] [SCHEDULER] uv 路径=C:\Users\serendipity\.local\bin\uv.exe
@@ -294,3 +297,4 @@ Get-Content .\logs\$(Get-Date -Format 'yyyy-MM-dd').log -Tail 100
 [2026-06-10 16:54:03.784] [SCHEDULER] 正式进程拉起时刻=2026-06-10 16:53:53.100305
 [2026-06-10 16:54:03.785] [SCHEDULER] 首条 main.py 日志时刻=2026-06-10 16:53:54.031723，相对目标偏差=+0.032秒
 [2026-06-10 16:54:03.785] [SCHEDULER] main.py 退出码=0
+```
