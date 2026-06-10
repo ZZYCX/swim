@@ -5,3 +5,4 @@ opencv-python==4.11.0.86
 numpy==1.26.4
 pillow==10.4.0
 pygetwindow==0.0.9
+pyperclip==1.11.0

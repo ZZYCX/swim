@@ -255,6 +255,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pyautogui" },
     { name = "pygetwindow" },
+    { name = "pyperclip" },
     { name = "pywinauto" },
 ]
 
@@ -266,5 +267,6 @@ requires-dist = [
     { name = "pillow", specifier = "==10.4.0" },
     { name = "pyautogui", specifier = "==0.9.54" },
     { name = "pygetwindow", specifier = "==0.0.9" },
+    { name = "pyperclip", specifier = "==1.11.0" },
     { name = "pywinauto", specifier = "==0.6.9" },
 ]

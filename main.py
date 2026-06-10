@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import glob
 import sys
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Iterable
 
@@ -14,7 +14,7 @@ import mss
 import numpy as np
 import pyautogui
 import pygetwindow as gw
-from pywinauto import Desktop
+import pyperclip
 from pywinauto.application import Application
 
 
@@ -22,13 +22,33 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.08
 
 
+MINIPROGRAM_URLS = {
+    1: "#小程序://奥冠体育/E3fnVdNHbsY1uiv",
+    2: "#小程序://奥冠体育/PLaOWaqqLhsMcWi",
+    3: "#小程序://奥冠体育/vuRORt1GZFNUGft",
+    4: "#小程序://奥冠体育/WkeN4N7l2i1n9Hd",
+    5: "#小程序://奥冠体育/aDkqsllgLL9IjpJ",
+    6: "#小程序://奥冠体育/bLo3551a5a2unxJ",
+    7: "#小程序://奥冠体育/9CP49TVTmnmpRIb",
+}
+
+WEEKDAY_NAMES = {
+    1: "星期一",
+    2: "星期二",
+    3: "星期三",
+    4: "星期四",
+    5: "星期五",
+    6: "星期六",
+    7: "星期日",
+}
+
 DEBUG_NAMES = {
     "wechat_found": "debug_01_wechat_found.png",
     "swim_chat": "debug_02_swim_chat.png",
-    "qr_detected": "debug_03_qr_detected.png",
-    "image_viewer": "debug_04_image_viewer.png",
-    "context_menu": "debug_05_context_menu.png",
-    "after_qr_recognition": "debug_06_after_qr_recognition.png",
+    "before_link_send": "debug_03_before_link_send.png",
+    "after_link_send": "debug_04_after_link_send.png",
+    "link_detected": "debug_05_link_detected.png",
+    "after_link_click": "debug_06_after_link_click.png",
     "miniprogram_page": "debug_07_miniprogram_page.png",
     "submit_button": "debug_08_submit_button.png",
     "after_click": "debug_09_after_click.png",
@@ -76,20 +96,17 @@ class Context:
     chat_name: str
     debug_dir: Path
     debug_mode: str
-    no_ocr: bool
     max_wait: int
     dry_run: bool
-    project_root: Path
     wechat_window: object | None = None
     wechat_uia: object | None = None
     wechat_rect: Rect | None = None
-    viewer_window: object | None = None
-    viewer_rect: Rect | None = None
+    miniprogram_rect: Rect | None = None
     screen_origin: tuple[int, int] = (0, 0)
     last_debug_path: Path | None = None
     last_debug_image: np.ndarray | None = None
     last_debug_key: str | None = None
-    qr_detection: Detection | None = None
+    link_detection: Detection | None = None
     submit_detection: Detection | None = None
 
 
@@ -127,6 +144,17 @@ def fail(step: str, reason: str) -> None:
     raise StepFailure(step, reason)
 
 
+def miniprogram_url_for_weekday(weekday: int) -> str:
+    try:
+        return MINIPROGRAM_URLS[weekday]
+    except KeyError as exc:
+        raise ValueError(f"weekday must be between 1 and 7, got {weekday}") from exc
+
+
+def miniprogram_url_for_date(value: date) -> str:
+    return miniprogram_url_for_weekday(value.isoweekday())
+
+
 def to_rect_from_pygetwindow(window: object) -> Rect:
     return Rect(
         int(window.left),
@@ -144,9 +172,7 @@ def find_wechat_windows() -> list[object]:
     windows = []
     for window in gw.getAllWindows():
         title = safe_window_title(window).strip()
-        if not title:
-            continue
-        if title == "微信" or ("微信" in title and "图片和视频" not in title):
+        if title and (title == "微信" or ("微信" in title and "图片和视频" not in title)):
             windows.append(window)
     windows.sort(key=lambda item: (safe_window_title(item) != "微信", safe_window_title(item)))
     return windows
@@ -191,7 +217,7 @@ def find_wechat_window():
     try:
         ctx.wechat_uia = connect_uia_window(window)
     except Exception as exc:
-        log(f"[WARN] UIA 连接微信窗口失败，将使用视觉检测兜底：{exc}")
+        log(f"[WARN] UIA 连接微信窗口失败，将使用几何和截图差分兜底：{exc}")
         ctx.wechat_uia = None
 
     log(
@@ -216,14 +242,12 @@ def capture_fullscreen_bgr() -> np.ndarray:
 
 
 def abs_rect_to_image_rect(rect: Rect) -> Rect:
-    ctx = require_ctx()
-    ox, oy = ctx.screen_origin
+    ox, oy = require_ctx().screen_origin
     return Rect(rect.left - ox, rect.top - oy, rect.right - ox, rect.bottom - oy)
 
 
 def image_rect_to_abs_rect(rect: Rect) -> Rect:
-    ctx = require_ctx()
-    ox, oy = ctx.screen_origin
+    ox, oy = require_ctx().screen_origin
     return Rect(rect.left + ox, rect.top + oy, rect.right + ox, rect.bottom + oy)
 
 
@@ -269,8 +293,7 @@ def save_debug_image(
 
 
 def screenshot_fullscreen(step_name: str) -> None:
-    image = capture_fullscreen_bgr()
-    save_debug_image(image, step_name)
+    save_debug_image(capture_fullscreen_bgr(), step_name)
 
 
 def persist_failure_debug(step: str) -> Path | None:
@@ -319,6 +342,13 @@ def element_auto_id(element: object) -> str:
         return ""
 
 
+def element_control_type(element: object) -> str:
+    try:
+        return str(element.element_info.control_type or "")
+    except Exception:
+        return ""
+
+
 def element_rect(element: object) -> Rect | None:
     try:
         rect = element.rectangle()
@@ -339,28 +369,12 @@ def current_chat_is_open(chat_name: str) -> bool:
             continue
         if "current_chat_name_label" in auto_id:
             return True
-        in_title_band = (
-            rect.left > ctx.wechat_rect.left + int(ctx.wechat_rect.width * 0.28)
-            and rect.top < ctx.wechat_rect.top + 120
-        )
-        if in_title_band:
+        if rect.left > ctx.wechat_rect.left + int(ctx.wechat_rect.width * 0.28) and rect.top < ctx.wechat_rect.top + 120:
             return True
     return False
 
 
-def click_element_center(element: object, reason: str) -> None:
-    ctx = require_ctx()
-    rect = element_rect(element)
-    if rect is None or rect.width <= 0 or rect.height <= 0:
-        fail(reason, "目标 UI 元素没有可靠边界，拒绝点击。")
-    x, y = rect.center
-    if ctx.dry_run:
-        log(f"[DRY-RUN] would click {reason} at ({x}, {y})")
-        return
-    pyautogui.click(x, y)
-
-
-def open_swim_chat():
+def open_swim_chat() -> None:
     ctx = require_ctx()
     if current_chat_is_open(ctx.chat_name):
         log(f"[OK] 当前已打开目标聊天：{ctx.chat_name}")
@@ -369,6 +383,206 @@ def open_swim_chat():
 
     screenshot_fullscreen("swim_chat")
     fail("open_swim_chat", f"当前微信聊天未确认为 {ctx.chat_name}；脚本不会自动搜索或切换聊天。")
+
+
+def chat_content_region() -> Rect:
+    ctx = require_ctx()
+    if ctx.wechat_rect is None:
+        fail("chat_content_region", "缺少微信窗口位置。")
+    rect = ctx.wechat_rect
+    return Rect(
+        rect.left + int(rect.width * 0.23),
+        rect.top + 75,
+        rect.right - 18,
+        rect.top + int(rect.height * 0.77),
+    )
+
+
+def point_inside(rect: Rect, bounds: Rect) -> bool:
+    cx, cy = rect.center
+    return bounds.left <= cx <= bounds.right and bounds.top <= cy <= bounds.bottom
+
+
+def locate_chat_input_point() -> tuple[int, int]:
+    ctx = require_ctx()
+    if ctx.wechat_rect is None:
+        fail("locate_chat_input", "缺少微信窗口位置。")
+
+    window = ctx.wechat_rect
+    min_left = window.left + int(window.width * 0.23)
+    min_top = window.top + int(window.height * 0.72)
+    candidates: list[Rect] = []
+    for element in uia_descendants():
+        if element_control_type(element) not in {"Edit", "Document"}:
+            continue
+        rect = element_rect(element)
+        if rect is None or rect.width < window.width * 0.25 or rect.height < 35:
+            continue
+        if rect.left >= min_left and rect.top >= min_top and point_inside(rect, window):
+            candidates.append(rect)
+
+    if candidates:
+        selected = max(candidates, key=lambda rect: rect.width * rect.height)
+        point = selected.center
+        log(f"[OK] 通过 UIA 定位聊天输入框：rect={selected}, point={point}")
+        return point
+
+    point = (
+        window.left + int(window.width * 0.62),
+        window.top + int(window.height * 0.86),
+    )
+    log(f"[WARN] UIA 未暴露聊天输入框，使用窗口比例坐标：point={point}")
+    return point
+
+
+def select_latest_link_rect(
+    candidates: Iterable[tuple[str, Rect]],
+    link: str,
+    chat_region: Rect,
+) -> Rect | None:
+    min_x = chat_region.left + int(chat_region.width * 0.52)
+    matches: list[tuple[Rect, Rect]] = []
+    for name, rect in candidates:
+        if name.strip() != link or rect.width <= 0 or rect.height <= 0:
+            continue
+        if not point_inside(rect, chat_region):
+            continue
+        if rect.width >= chat_region.width * 0.75 and rect.right >= chat_region.right - 60:
+            clickable = Rect(
+                max(min_x, rect.right - int(chat_region.width * 0.42)),
+                rect.top,
+                rect.right - int(chat_region.width * 0.06),
+                rect.bottom,
+            )
+            matches.append((rect, clickable))
+        elif rect.center[0] >= min_x:
+            matches.append((rect, rect))
+
+    if not matches:
+        return None
+    return max(matches, key=lambda item: (item[0].center[1], item[0].center[0]))[1]
+
+
+def locate_sent_link_by_uia(link: str) -> Detection | None:
+    entries = []
+    for element in uia_descendants():
+        rect = element_rect(element)
+        if rect is not None:
+            entries.append((element_name(element), rect))
+    selected = select_latest_link_rect(entries, link, chat_content_region())
+    if selected is None:
+        return None
+    return Detection(selected, selected.center, 1.0, "uia-link")
+
+
+def difference_message_candidates(
+    before: np.ndarray,
+    after: np.ndarray,
+    region: Rect,
+) -> list[Detection]:
+    if before.shape != after.shape or before.ndim != 3:
+        return []
+    bounds = Rect(0, 0, before.shape[1], before.shape[0])
+    region = region.clamp(bounds)
+    if region.width <= 0 or region.height <= 0:
+        return []
+
+    crop_before = before[region.top : region.bottom, region.left : region.right]
+    crop_after = after[region.top : region.bottom, region.left : region.right]
+    diff = cv2.absdiff(crop_before, crop_after)
+    gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 28, 255, cv2.THRESH_BINARY)
+    mask[:, : int(region.width * 0.52)] = 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    mask = cv2.dilate(mask, np.ones((13, 31), np.uint8), iterations=1)
+
+    changed_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+    if changed_ratio < 0.0008 or changed_ratio > 0.18:
+        return []
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    detections = []
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        if width < 70 or height < 18:
+            continue
+        if width > region.width * 0.48 or height > region.height * 0.28:
+            continue
+        bbox = Rect(region.left + x, region.top + y, region.left + x + width, region.top + y + height)
+        area = float(cv2.contourArea(contour))
+        detections.append(Detection(bbox, bbox.center, area, "diff-link"))
+
+    if not detections:
+        return []
+    latest_y = max(item.center[1] for item in detections)
+    latest_row = [
+        item
+        for item in detections
+        if latest_y - item.center[1] <= max(40, item.bbox.height * 1.5)
+    ]
+    latest_row.sort(key=lambda item: item.score, reverse=True)
+    return latest_row[:1]
+
+
+def locate_sent_link_by_difference(before: np.ndarray, after: np.ndarray) -> Detection | None:
+    image_region = abs_rect_to_image_rect(chat_content_region())
+    candidates = difference_message_candidates(before, after, image_region)
+    if len(candidates) != 1:
+        return None
+    image_detection = candidates[0]
+    bbox = image_rect_to_abs_rect(image_detection.bbox)
+    return Detection(bbox, bbox.center, image_detection.score, image_detection.label)
+
+
+def send_link_message(link: str) -> tuple[np.ndarray, np.ndarray]:
+    ctx = require_ctx()
+    input_point = locate_chat_input_point()
+    before = capture_fullscreen_bgr()
+    save_debug_image(before, "before_link_send")
+
+    if ctx.dry_run:
+        log(f"[DRY-RUN] 将清空输入框并发送：{link}")
+        return before, before.copy()
+
+    pyautogui.click(*input_point)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.press("backspace")
+    pyperclip.copy(link)
+    pyautogui.hotkey("ctrl", "v")
+    pyautogui.press("enter")
+    time.sleep(1.0)
+
+    after = capture_fullscreen_bgr()
+    save_debug_image(after, "after_link_send")
+    log(f"[OK] 已发送当天小程序链接：{link}")
+    return before, after
+
+
+def locate_sent_link(link: str, before: np.ndarray, initial_after: np.ndarray) -> Detection:
+    ctx = require_ctx()
+    deadline = time.time() + min(5, ctx.max_wait)
+    after = initial_after
+    while time.time() < deadline:
+        detection = locate_sent_link_by_uia(link)
+        if detection is None:
+            detection = locate_sent_link_by_difference(before, after)
+        if detection is not None:
+            ctx.link_detection = detection
+            save_debug_image(after, "link_detected", [detection])
+            log(f"[OK] 定位刚发送的链接：center={detection.center}, method={detection.label}")
+            return detection
+        time.sleep(0.4)
+        after = capture_fullscreen_bgr()
+
+    save_debug_image(after, "link_detected")
+    fail("locate_sent_link", "未能通过 UIA 或截图差分可靠定位刚发送的链接，拒绝盲点。")
+
+
+def click_sent_link(detection: Detection) -> None:
+    pyautogui.click(*detection.center)
+    time.sleep(1.0)
+    screenshot_fullscreen("after_link_click")
+    log(f"[OK] 已点击当天小程序链接：center={detection.center}")
 
 
 def crop_by_rect(image: np.ndarray, rect: Rect) -> tuple[np.ndarray, Rect]:
@@ -380,389 +594,18 @@ def crop_by_rect(image: np.ndarray, rect: Rect) -> tuple[np.ndarray, Rect]:
     return image[image_rect.top : image_rect.bottom, image_rect.left : image_rect.right], image_rect
 
 
-def chat_content_region() -> Rect:
-    ctx = require_ctx()
-    if ctx.wechat_rect is None:
-        fail("detect_qr_image_in_chat", "缺少微信窗口位置。")
-    rect = ctx.wechat_rect
-    return Rect(
-        rect.left + int(rect.width * 0.30),
-        rect.top + 75,
-        rect.right - 18,
-        rect.top + int(rect.height * 0.77),
-    )
-
-
-def template_paths() -> list[Path]:
-    ctx = require_ctx()
-    candidates = []
-    for root in (ctx.project_root / "images", ctx.project_root.parent / "images"):
-        candidates.extend(Path(path) for path in glob.glob(str(root / "*.jpg")))
-        candidates.extend(Path(path) for path in glob.glob(str(root / "*.png")))
-    return sorted(set(candidates))
-
-
-def match_templates(crop: np.ndarray, crop_rect: Rect) -> Detection | None:
-    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    gray_crop = cv2.GaussianBlur(gray_crop, (3, 3), 0)
-    best: Detection | None = None
-    for template_path in template_paths():
-        template = cv2.imread(str(template_path), cv2.IMREAD_GRAYSCALE)
-        if template is None:
-            continue
-        template = cv2.GaussianBlur(template, (3, 3), 0)
-        for scale in np.linspace(0.08, 0.42, 44):
-            resized = cv2.resize(template, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-            th, tw = resized.shape[:2]
-            if tw < 55 or th < 55 or tw >= gray_crop.shape[1] or th >= gray_crop.shape[0]:
-                continue
-            result = cv2.matchTemplate(gray_crop, resized, cv2.TM_CCOEFF_NORMED)
-            _, score, _, max_loc = cv2.minMaxLoc(result)
-            if best is None or score > best.score:
-                image_left = crop_rect.left + max_loc[0]
-                image_top = crop_rect.top + max_loc[1]
-                bbox = image_rect_to_abs_rect(Rect(image_left, image_top, image_left + tw, image_top + th))
-                best = Detection(
-                    bbox=bbox,
-                    center=bbox.center,
-                    score=float(score),
-                    label=f"template:{template_path.name}",
-                )
-    if best and best.score >= 0.42:
-        return best
-    return None
-
-
-def high_frequency_score(gray: np.ndarray) -> float:
-    if gray.size == 0:
-        return 0.0
-    edges = cv2.Canny(gray, 80, 180)
-    edge_density = float(np.count_nonzero(edges)) / float(edges.size)
-    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var()) / 1000.0
-    return edge_density + min(lap_var, 2.0)
-
-
-def green_icon_candidates(crop: np.ndarray, crop_rect: Rect) -> list[Detection]:
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([35, 75, 80]), np.array([95, 255, 255]))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    detections = []
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 80:
-            continue
-        x, y, w, h = cv2.boundingRect(contour)
-        if not (0.55 <= w / max(h, 1) <= 1.8):
-            continue
-        icon_cx = x + w / 2
-        icon_cy = y + h / 2
-        for factor in (4.5, 5.5, 6.5, 7.5):
-            size = int(max(w, h) * factor)
-            if size < 80 or size > 380:
-                continue
-            left = int(icon_cx - size * 0.78)
-            top = int(icon_cy - size * 0.78)
-            right = left + size
-            bottom = top + size
-            if left < 0 or top < 0 or right >= crop.shape[1] or bottom >= crop.shape[0]:
-                continue
-            patch = gray[top:bottom, left:right]
-            freq = high_frequency_score(patch)
-            white_ratio = float(np.mean(patch > 225))
-            black_ratio = float(np.mean(patch < 60))
-            if freq < 0.12 or white_ratio < 0.25 or black_ratio < 0.04:
-                continue
-            image_box = Rect(crop_rect.left + left, crop_rect.top + top, crop_rect.left + right, crop_rect.top + bottom)
-            abs_box = image_rect_to_abs_rect(image_box)
-            detections.append(
-                Detection(
-                    bbox=abs_box,
-                    center=abs_box.center,
-                    score=float(freq + white_ratio + black_ratio),
-                    label="green-icon-qr",
-                )
-            )
-    detections.sort(key=lambda det: det.score, reverse=True)
-    return detections
-
-
-def square_texture_candidates(crop: np.ndarray, crop_rect: Rect) -> list[Detection]:
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    binary = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        4,
-    )
-    contours, _ = cv2.findContours(255 - binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    detections = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        if w < 80 or h < 80 or w > 380 or h > 380:
-            continue
-        ratio = w / max(h, 1)
-        if not (0.72 <= ratio <= 1.28):
-            continue
-        left = max(0, x - 12)
-        top = max(0, y - 12)
-        right = min(crop.shape[1], x + w + 12)
-        bottom = min(crop.shape[0], y + h + 12)
-        patch = gray[top:bottom, left:right]
-        freq = high_frequency_score(patch)
-        white_ratio = float(np.mean(patch > 225))
-        black_ratio = float(np.mean(patch < 70))
-        if freq < 0.15 or white_ratio < 0.20 or black_ratio < 0.05:
-            continue
-        image_box = Rect(crop_rect.left + left, crop_rect.top + top, crop_rect.left + right, crop_rect.top + bottom)
-        abs_box = image_rect_to_abs_rect(image_box)
-        detections.append(
-            Detection(
-                bbox=abs_box,
-                center=abs_box.center,
-                score=float(freq + white_ratio + black_ratio),
-                label="square-texture-qr",
-            )
-        )
-    detections.sort(key=lambda det: det.score, reverse=True)
-    return detections
-
-
-def detect_qr_image_in_chat() -> tuple[Rect, tuple[int, int]]:
-    ctx = require_ctx()
-    image = capture_fullscreen_bgr()
-    region = chat_content_region()
-    crop, crop_rect = crop_by_rect(image, region)
-
-    detection = match_templates(crop, crop_rect)
-    if detection is None:
-        generic = green_icon_candidates(crop, crop_rect) + square_texture_candidates(crop, crop_rect)
-        generic.sort(key=lambda det: det.score, reverse=True)
-        detection = generic[0] if generic else None
-
-    if detection is None:
-        save_debug_image(image, "qr_detected")
-        fail("detect_qr_image_in_chat", "在微信聊天区域内未找到二维码图片候选。")
-
-    ctx.qr_detection = detection
-    save_debug_image(image, "qr_detected", [detection])
-    log(f"[OK] 定位二维码图片：bbox={detection.bbox}, center={detection.center}, score={detection.score:.3f}")
-    return detection.bbox, detection.center
-
-
-def find_image_viewer_window() -> object | None:
-    for window in gw.getAllWindows():
-        title = safe_window_title(window).strip()
-        if "图片和视频" in title or "Image" in title:
-            return window
-    return None
-
-
-def open_qr_image_viewer(qr_center: tuple[int, int]):
-    ctx = require_ctx()
-    if ctx.dry_run:
-        image = capture_fullscreen_bgr()
-        save_debug_image(image, "image_viewer")
-        log(f"[DRY-RUN] would open QR image viewer by double-clicking {qr_center}")
-        return None
-
-    pyautogui.doubleClick(qr_center[0], qr_center[1])
-    time.sleep(1.5)
-
-    viewer = find_image_viewer_window()
-    image = capture_fullscreen_bgr()
-    save_debug_image(image, "image_viewer")
-    if viewer is None:
-        fail("open_qr_image_viewer", "点击二维码后未检测到“图片和视频”查看器窗口。")
-
-    activate_window(viewer)
-    ctx.viewer_window = viewer
-    ctx.viewer_rect = to_rect_from_pygetwindow(viewer)
-    if ctx.viewer_rect.width < 300 or ctx.viewer_rect.height < 300:
-        fail("open_qr_image_viewer", f"图片查看器窗口尺寸异常：{ctx.viewer_rect.width}x{ctx.viewer_rect.height}")
-
-    log(f"[OK] 图片查看器已打开：rect={ctx.viewer_rect}")
-    return viewer
-
-
-def desktop_menu_items() -> list[object]:
-    try:
-        desktop = Desktop(backend="uia")
-        items = []
-        for window in desktop.windows():
-            try:
-                for element in window.descendants(control_type="MenuItem"):
-                    name = element_name(element).strip()
-                    if name:
-                        items.append(element)
-            except Exception:
-                continue
-        return items
-    except Exception as exc:
-        log(f"[WARN] 读取右键菜单 UIA 元素失败：{exc}")
-        return []
-
-
-def click_recognize_menu_by_uia() -> bool:
-    targets = ("识别图中二维码", "识别二维码")
-    deadline = time.time() + 2.0
-    while time.time() < deadline:
-        for item in desktop_menu_items():
-            name = element_name(item).strip()
-            if any(target in name for target in targets):
-                click_element_center(item, "click_recognize_qr_menu.uia_menu")
-                log(f"[OK] 已通过 UIA 点击菜单项：{name}")
-                return True
-        time.sleep(0.2)
-    return False
-
-
-def detect_context_menu_rect(image: np.ndarray, click_point: tuple[int, int]) -> Rect | None:
-    ox, oy = require_ctx().screen_origin
-    px, py = click_point[0] - ox, click_point[1] - oy
-    search = Rect(px - 260, py - 380, px + 430, py + 760).clamp(Rect(0, 0, image.shape[1], image.shape[0]))
-    crop = image[search.top : search.bottom, search.left : search.right]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    mask = cv2.inRange(gray, 235, 255)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        area = cv2.contourArea(contour)
-        if area < 3500 or w < 90 or h < 110 or w > 420 or h > 760:
-            continue
-        candidates.append((area, Rect(search.left + x + ox, search.top + y + oy, search.left + x + w + ox, search.top + y + h + oy)))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1] if candidates else None
-
-
-def synthetic_context_menu_rect(image: np.ndarray, click_point: tuple[int, int]) -> Rect | None:
-    ctx = require_ctx()
-    ox, oy = ctx.screen_origin
-    px, py = click_point[0] - ox, click_point[1] - oy
-    candidate = Rect(px - 8, py - 8, px + 320, py + 620).clamp(Rect(0, 0, image.shape[1], image.shape[0]))
-    if candidate.width < 260 or candidate.height < 500:
-        return None
-
-    crop = image[candidate.top : candidate.bottom, candidate.left : candidate.right]
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-
-    # The WeChat image-viewer menu contains many short dark text/icon strokes
-    # arranged as horizontal rows. A plain QR background does not form this
-    # regular row projection in the menu text band.
-    text_band = gray[:, int(candidate.width * 0.10) : int(candidate.width * 0.78)]
-    dark = text_band < 120
-    row_projection = dark.sum(axis=1)
-    active_rows = row_projection > max(8, text_band.shape[1] * 0.04)
-    groups = []
-    start = None
-    for idx, active in enumerate(active_rows):
-        if active and start is None:
-            start = idx
-        elif not active and start is not None:
-            if idx - start >= 3:
-                groups.append((start, idx))
-            start = None
-    if start is not None and len(active_rows) - start >= 3:
-        groups.append((start, len(active_rows)))
-
-    expected_menu_area = gray[: int(candidate.height * 0.88), :]
-    light_ratio = float(np.mean(expected_menu_area > 225))
-    if len(groups) < 8 or light_ratio < 0.45:
-        return None
-
-    return image_rect_to_abs_rect(candidate)
-
-
-def menu_row_centers(image: np.ndarray, menu_rect: Rect) -> list[int]:
-    ctx = require_ctx()
-    crop, crop_rect = crop_by_rect(image, menu_rect)
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    text_band = gray[:, int(crop.shape[1] * 0.08) : int(crop.shape[1] * 0.95)]
-    row_projection = np.sum(text_band < 150, axis=1).astype(np.float32)
-
-    kernel_size = max(7, int(crop.shape[0] * 0.025))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    smoothed = np.convolve(row_projection, np.ones(kernel_size) / kernel_size, mode="same")
-
-    threshold = max(5.0, text_band.shape[1] * 0.025)
-    min_distance = max(30, int(crop.shape[0] * 0.065))
-    edge_margin = int(crop.shape[0] * 0.04)
-    selected: list[int] = []
-    for raw_index in np.argsort(smoothed)[::-1]:
-        index = int(raw_index)
-        if smoothed[index] < threshold:
-            break
-        if index < edge_margin or index > crop.shape[0] - edge_margin:
-            continue
-        if all(abs(index - existing) >= min_distance for existing in selected):
-            selected.append(index)
-
-    selected.sort()
-    return [crop_rect.top + index + ctx.screen_origin[1] for index in selected]
-
-
-def fallback_click_recognize_menu(image: np.ndarray, menu_rect: Rect) -> bool:
-    ctx = require_ctx()
-    if menu_rect.height < 110 or menu_rect.width < 90:
-        return False
-    row_centers = menu_row_centers(image, menu_rect)
-    if len(row_centers) < 8:
-        log(f"[WARN] 右键菜单只检测到 {len(row_centers)} 行，拒绝按行位置点击。")
-        return False
-    x = menu_rect.left + int(menu_rect.width * 0.55)
-    # The QR-recognition item is followed by "open with system default"
-    # and "save as", so it is the third visible row from the bottom.
-    y = row_centers[-3]
-    if ctx.dry_run:
-        log(
-            f"[DRY-RUN] would click fallback recognize menu row at ({x}, {y}), "
-            f"menu={menu_rect}, rows={row_centers}"
-        )
-        return True
-    pyautogui.click(x, y)
-    log(f"[OK] 已按菜单行结构兜底点击：menu={menu_rect}, rows={row_centers}, point=({x}, {y})")
-    return True
-
-
-def click_recognize_qr_menu():
-    ctx = require_ctx()
-    if ctx.viewer_rect is None:
-        fail("click_recognize_qr_menu", "缺少图片查看器窗口位置。")
-
-    click_point = ctx.viewer_rect.center
-    if ctx.dry_run:
-        image = capture_fullscreen_bgr()
-        save_debug_image(image, "context_menu")
-        log(f"[DRY-RUN] would right-click image viewer center {click_point}")
-        return
-
-    pyautogui.click(click_point[0], click_point[1], button="right")
-    time.sleep(0.5)
-    image = capture_fullscreen_bgr()
-    save_debug_image(image, "context_menu")
-
-    menu_rect = detect_context_menu_rect(image, click_point)
-    if menu_rect is None:
-        menu_rect = synthetic_context_menu_rect(image, click_point)
-    if menu_rect is None:
-        fail("click_recognize_qr_menu", "右键菜单已截图，但无法定位“识别二维码”菜单区域。")
-    if not fallback_click_recognize_menu(image, menu_rect):
-        fail("click_recognize_qr_menu", f"右键菜单区域不满足兜底点击条件：{menu_rect}")
-
-    time.sleep(4.0)
-    screenshot_fullscreen("after_qr_recognition")
-
-
 def candidate_target_window_rect() -> Rect:
     ctx = require_ctx()
+    for window in gw.getAllWindows():
+        title = safe_window_title(window).strip()
+        if "奥冠体育" not in title:
+            continue
+        rect = to_rect_from_pygetwindow(window)
+        if rect.width >= 300 and rect.height >= 300:
+            ctx.miniprogram_rect = rect
+            return rect
+    if ctx.miniprogram_rect is not None:
+        return ctx.miniprogram_rect
     active = gw.getActiveWindow()
     if active is not None and safe_window_title(active).strip():
         rect = to_rect_from_pygetwindow(active)
@@ -777,13 +620,11 @@ def candidate_target_window_rect() -> Rect:
 
 def orange_button_candidates(image: np.ndarray, target_rect: Rect) -> list[Detection]:
     crop, crop_rect = crop_by_rect(image, target_rect)
-    h, w = crop.shape[:2]
-    search_local = Rect(int(w * 0.12), int(h * 0.55), w - 8, h - 8)
+    height, width = crop.shape[:2]
+    search_local = Rect(int(width * 0.12), int(height * 0.55), width - 8, height - 8)
     search = crop[search_local.top : search_local.bottom, search_local.left : search_local.right]
     hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
-    lower1 = np.array([0, 70, 120])
-    upper1 = np.array([28, 255, 255])
-    mask = cv2.inRange(hsv, lower1, upper1)
+    mask = cv2.inRange(hsv, np.array([0, 70, 120]), np.array([28, 255, 255]))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -793,21 +634,23 @@ def orange_button_candidates(image: np.ndarray, target_rect: Rect) -> list[Detec
         area = cv2.contourArea(contour)
         if area < 900:
             continue
-        x, y, bw, bh = cv2.boundingRect(contour)
-        if bw < 70 or bh < 26 or bh > 120:
+        x, y, box_width, box_height = cv2.boundingRect(contour)
+        if box_width < 70 or box_height < 26 or box_height > 120:
             continue
-        ratio = bw / max(bh, 1)
-        if not (1.8 <= ratio <= 8.5):
+        ratio = box_width / max(box_height, 1)
+        if not 1.8 <= ratio <= 8.5:
             continue
         image_left = crop_rect.left + search_local.left + x
         image_top = crop_rect.top + search_local.top + y
-        bbox = image_rect_to_abs_rect(Rect(image_left, image_top, image_left + bw, image_top + bh))
+        bbox = image_rect_to_abs_rect(
+            Rect(image_left, image_top, image_left + box_width, image_top + box_height)
+        )
         cx, cy = bbox.center
-        dist = ((target_rect.right - cx) ** 2 + (target_rect.bottom - cy) ** 2) ** 0.5
-        score = float(area / 1000.0 - dist / 1000.0 + ratio / 10.0)
-        detections.append(Detection(bbox=bbox, center=bbox.center, score=score, label="orange-submit"))
+        distance = ((target_rect.right - cx) ** 2 + (target_rect.bottom - cy) ** 2) ** 0.5
+        score = float(area / 1000.0 - distance / 1000.0 + ratio / 10.0)
+        detections.append(Detection(bbox, bbox.center, score, "orange-submit"))
 
-    detections.sort(key=lambda det: det.score, reverse=True)
+    detections.sort(key=lambda detection: detection.score, reverse=True)
     return detections
 
 
@@ -836,31 +679,31 @@ def notice_dialog_candidate(image: np.ndarray, target_rect: Rect) -> Detection |
     return candidates[0] if candidates else None
 
 
-def wait_for_miniprogram_page():
+def wait_for_miniprogram_page() -> None:
     ctx = require_ctx()
     deadline = time.time() + ctx.max_wait
-    best: Detection | None = None
     best_image: np.ndarray | None = None
     notice_dismissed = False
     while time.time() < deadline:
         image = capture_fullscreen_bgr()
         target_rect = candidate_target_window_rect()
-        candidates = submit_button_candidates(image, target_rect)
-        if candidates:
-            best = candidates[0]
-            best_image = image
-            save_debug_image(image, "miniprogram_page", [best])
-            log("[OK] 检测到小程序页面候选橙色提交区域。")
-            return
         if not notice_dismissed:
             notice = notice_dialog_candidate(image, target_rect)
             if notice is not None:
                 save_debug_image(image, "miniprogram_page", [notice])
-                pyautogui.click(notice.center[0], notice.center[1])
+                pyautogui.click(*notice.center)
                 notice_dismissed = True
                 log(f"[OK] 已关闭须知弹窗：center={notice.center}")
                 time.sleep(1.0)
                 continue
+        candidates = submit_button_candidates(image, target_rect)
+        if candidates:
+            detection = candidates[0]
+            ctx.submit_detection = detection
+            save_debug_image(image, "miniprogram_page", [detection])
+            save_debug_image(image, "submit_button", [detection])
+            log("[OK] 检测到小程序页面并锁定橙色提交区域。")
+            return
         best_image = image
         time.sleep(1.0)
 
@@ -871,6 +714,11 @@ def wait_for_miniprogram_page():
 
 def detect_submit_button() -> tuple[Rect, tuple[int, int]]:
     ctx = require_ctx()
+    if ctx.submit_detection is not None:
+        detection = ctx.submit_detection
+        log(f"[OK] 复用已验证的提交订单按钮：bbox={detection.bbox}, center={detection.center}")
+        return detection.bbox, detection.center
+
     image = capture_fullscreen_bgr()
     target_rect = candidate_target_window_rect()
     candidates = submit_button_candidates(image, target_rect)
@@ -885,15 +733,8 @@ def detect_submit_button() -> tuple[Rect, tuple[int, int]]:
     return detection.bbox, detection.center
 
 
-def click_submit_once(button_center: tuple[int, int]):
-    ctx = require_ctx()
-    if ctx.dry_run:
-        image = capture_fullscreen_bgr()
-        save_debug_image(image, "after_click")
-        log(f"[DRY-RUN] would click submit once at {button_center}")
-        return
-
-    pyautogui.click(button_center[0], button_center[1])
+def click_submit_once(button_center: tuple[int, int]) -> None:
+    pyautogui.click(*button_center)
     time.sleep(1.0)
     screenshot_fullscreen("after_click")
     log("[DONE] 已点击一次“提交订单”。")
@@ -909,9 +750,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="all",
         help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 all",
     )
-    parser.add_argument("--no-ocr", action="store_true", default=True, help="兼容参数：默认不依赖 OCR")
     parser.add_argument("--max-wait", type=int, default=20, help="等待小程序页面最长秒数，默认 20")
-    parser.add_argument("--dry-run", action="store_true", help="只检测，不执行鼠标/键盘点击")
+    parser.add_argument("--dry-run", action="store_true", help="只验证微信、聊天和当天链接，不发送或点击")
     return parser.parse_args(argv)
 
 
@@ -919,29 +759,32 @@ def main(argv: list[str] | None = None) -> int:
     global CTX
     set_dpi_awareness()
     args = parse_args(argv or sys.argv[1:])
-    project_root = Path(__file__).resolve().parent
     CTX = Context(
         chat_name=args.chat_name,
         debug_dir=Path(args.debug_dir).resolve(),
         debug_mode=args.debug_mode,
-        no_ocr=args.no_ocr,
         max_wait=max(1, args.max_wait),
         dry_run=args.dry_run,
-        project_root=project_root,
     )
     CTX.debug_dir.mkdir(parents=True, exist_ok=True)
+
+    today = date.today()
+    weekday = today.isoweekday()
+    link = miniprogram_url_for_date(today)
+    log(f"[INFO] 日期={today.isoformat()}，{WEEKDAY_NAMES[weekday]}，链接={link}")
 
     try:
         find_wechat_window()
         screenshot_fullscreen("wechat_found")
         open_swim_chat()
-        _, qr_center = detect_qr_image_in_chat()
         if CTX.dry_run:
-            open_qr_image_viewer(qr_center)
-            log("[DRY-RUN] 已完成可见状态检测；后续打开图片、识别二维码、点击提交订单均未执行。")
+            locate_chat_input_point()
+            log("[DRY-RUN] 已验证微信窗口、目标聊天、输入框和当天链接；未清空、发送或点击。")
             return 0
-        open_qr_image_viewer(qr_center)
-        click_recognize_qr_menu()
+
+        before, after = send_link_message(link)
+        link_detection = locate_sent_link(link, before, after)
+        click_sent_link(link_detection)
         wait_for_miniprogram_page()
         _, button_center = detect_submit_button()
         click_submit_once(button_center)
@@ -954,7 +797,7 @@ def main(argv: list[str] | None = None) -> int:
             log(f"[FAIL] debug={debug_path}")
         return 1
     except Exception as exc:
-        log(f"[FAIL] step=unexpected")
+        log("[FAIL] step=unexpected")
         log(f"[FAIL] reason={exc}")
         debug_path = persist_failure_debug("unexpected")
         if debug_path:
