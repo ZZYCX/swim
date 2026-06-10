@@ -1,0 +1,7 @@
+pywinauto==0.6.9
+pyautogui==0.9.54
+mss==10.1.0
+opencv-python==4.11.0.86
+numpy==1.26.4
+pillow==10.4.0
+pygetwindow==0.0.9
