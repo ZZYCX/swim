@@ -75,6 +75,7 @@ class Detection:
 class Context:
     chat_name: str
     debug_dir: Path
+    debug_mode: str
     no_ocr: bool
     max_wait: int
     dry_run: bool
@@ -86,6 +87,8 @@ class Context:
     viewer_rect: Rect | None = None
     screen_origin: tuple[int, int] = (0, 0)
     last_debug_path: Path | None = None
+    last_debug_image: np.ndarray | None = None
+    last_debug_key: str | None = None
     qr_detection: Detection | None = None
     submit_detection: Detection | None = None
 
@@ -246,27 +249,46 @@ def save_debug_image(
     image: np.ndarray,
     debug_key: str,
     detections: Iterable[Detection] | None = None,
-) -> Path:
+) -> None:
     ctx = require_ctx()
-    name = DEBUG_NAMES.get(debug_key, f"{debug_key}.png")
-    path = ctx.debug_dir / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     output = image.copy()
     for index, detection in enumerate(detections or []):
         color = (0, 255, 0) if index == 0 else (0, 200, 255)
         draw_detection(output, detection, color)
 
-    if not cv2.imwrite(str(path), output):
-        fail("screenshot_fullscreen", f"debug 截图保存失败：{path}")
-    ctx.last_debug_path = path
-    log(f"[DEBUG] saved {path}")
-    return path
+    ctx.last_debug_image = output
+    ctx.last_debug_key = debug_key
+
+    if ctx.debug_mode == "all":
+        path = ctx.debug_dir / DEBUG_NAMES.get(debug_key, f"{debug_key}.png")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not cv2.imwrite(str(path), output):
+            fail("screenshot_fullscreen", f"debug 截图保存失败：{path}")
+        ctx.last_debug_path = path
+        log(f"[DEBUG] saved {path}")
 
 
-def screenshot_fullscreen(step_name: str) -> Path:
+def screenshot_fullscreen(step_name: str) -> None:
     image = capture_fullscreen_bgr()
-    return save_debug_image(image, step_name)
+    save_debug_image(image, step_name)
+
+
+def persist_failure_debug(step: str) -> Path | None:
+    ctx = require_ctx()
+    if ctx.debug_mode == "all" and ctx.last_debug_path is not None:
+        return ctx.last_debug_path
+    if ctx.last_debug_image is None:
+        return None
+
+    safe_step = "".join(char if char.isalnum() or char in "-_" else "_" for char in step)
+    path = ctx.debug_dir / f"debug_failure_{safe_step}.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), ctx.last_debug_image):
+        log(f"[FAIL] debug screenshot save failed: {path}")
+        return None
+
+    ctx.last_debug_path = path
+    return path
 
 
 def uia_descendants():
@@ -293,13 +315,6 @@ def element_name(element: object) -> str:
 def element_auto_id(element: object) -> str:
     try:
         return str(element.element_info.automation_id or "")
-    except Exception:
-        return ""
-
-
-def element_control_type(element: object) -> str:
-    try:
-        return str(element.element_info.control_type or "")
     except Exception:
         return ""
 
@@ -333,36 +348,6 @@ def current_chat_is_open(chat_name: str) -> bool:
     return False
 
 
-def find_search_edit():
-    for element in uia_descendants():
-        if element_control_type(element) != "Edit":
-            continue
-        name = element_name(element).strip()
-        auto_id = element_auto_id(element)
-        if name == "搜索" or "search" in auto_id.lower():
-            return element
-    return None
-
-
-def find_session_item(chat_name: str):
-    ctx = require_ctx()
-    if ctx.wechat_rect is None:
-        return None
-    candidates = []
-    for element in uia_descendants():
-        if element_control_type(element) != "ListItem":
-            continue
-        name = element_name(element)
-        rect = element_rect(element)
-        if rect is None or chat_name not in name:
-            continue
-        if rect.right <= ctx.wechat_rect.left + int(ctx.wechat_rect.width * 0.42):
-            score = 1.0 if name.strip().startswith(chat_name) else 0.5
-            candidates.append((score, rect.top, element))
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return candidates[0][2] if candidates else None
-
-
 def click_element_center(element: object, reason: str) -> None:
     ctx = require_ctx()
     rect = element_rect(element)
@@ -382,33 +367,8 @@ def open_swim_chat():
         screenshot_fullscreen("swim_chat")
         return
 
-    if ctx.dry_run:
-        screenshot_fullscreen("swim_chat")
-        fail("open_swim_chat", f"dry-run 模式下不会输入或点击，且当前未确认打开 {ctx.chat_name}。")
-
-    search = find_search_edit()
-    if search is None:
-        fail("open_swim_chat", "找不到微信左侧搜索框。")
-
-    click_element_center(search, "open_swim_chat.search")
-    time.sleep(0.2)
-    pyautogui.hotkey("ctrl", "a")
-    pyautogui.write(ctx.chat_name, interval=0.02)
-    time.sleep(0.8)
-
-    item = find_session_item(ctx.chat_name)
-    if item is None:
-        fail("open_swim_chat", f"搜索后找不到目标聊天：{ctx.chat_name}")
-    click_element_center(item, "open_swim_chat.session_item")
-    time.sleep(0.8)
-
-    ctx.wechat_uia = connect_uia_window(ctx.wechat_window)
-    if not current_chat_is_open(ctx.chat_name):
-        screenshot_fullscreen("swim_chat")
-        fail("open_swim_chat", f"无法确认目标聊天已打开：{ctx.chat_name}")
-
-    log(f"[OK] 已打开目标聊天：{ctx.chat_name}")
     screenshot_fullscreen("swim_chat")
+    fail("open_swim_chat", f"当前微信聊天未确认为 {ctx.chat_name}；脚本不会自动搜索或切换聊天。")
 
 
 def crop_by_rect(image: np.ndarray, rect: Rect) -> tuple[np.ndarray, Rect]:
@@ -664,7 +624,7 @@ def click_recognize_menu_by_uia() -> bool:
 def detect_context_menu_rect(image: np.ndarray, click_point: tuple[int, int]) -> Rect | None:
     ox, oy = require_ctx().screen_origin
     px, py = click_point[0] - ox, click_point[1] - oy
-    search = Rect(px - 260, py - 380, px + 430, py + 560).clamp(Rect(0, 0, image.shape[1], image.shape[0]))
+    search = Rect(px - 260, py - 380, px + 430, py + 760).clamp(Rect(0, 0, image.shape[1], image.shape[0]))
     crop = image[search.top : search.bottom, search.left : search.right]
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     mask = cv2.inRange(gray, 235, 255)
@@ -675,7 +635,7 @@ def detect_context_menu_rect(image: np.ndarray, click_point: tuple[int, int]) ->
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         area = cv2.contourArea(contour)
-        if area < 3500 or w < 90 or h < 110 or w > 420 or h > 580:
+        if area < 3500 or w < 90 or h < 110 or w > 420 or h > 760:
             continue
         candidates.append((area, Rect(search.left + x + ox, search.top + y + oy, search.left + x + w + ox, search.top + y + h + oy)))
     candidates.sort(key=lambda item: item[0], reverse=True)
@@ -686,8 +646,8 @@ def synthetic_context_menu_rect(image: np.ndarray, click_point: tuple[int, int])
     ctx = require_ctx()
     ox, oy = ctx.screen_origin
     px, py = click_point[0] - ox, click_point[1] - oy
-    candidate = Rect(px - 8, py - 8, px + 275, py + 430).clamp(Rect(0, 0, image.shape[1], image.shape[0]))
-    if candidate.width < 210 or candidate.height < 300:
+    candidate = Rect(px - 8, py - 8, px + 320, py + 620).clamp(Rect(0, 0, image.shape[1], image.shape[0]))
+    if candidate.width < 260 or candidate.height < 500:
         return None
 
     crop = image[candidate.top : candidate.bottom, candidate.left : candidate.right]
@@ -720,19 +680,55 @@ def synthetic_context_menu_rect(image: np.ndarray, click_point: tuple[int, int])
     return image_rect_to_abs_rect(candidate)
 
 
-def fallback_click_recognize_menu(menu_rect: Rect) -> bool:
+def menu_row_centers(image: np.ndarray, menu_rect: Rect) -> list[int]:
+    ctx = require_ctx()
+    crop, crop_rect = crop_by_rect(image, menu_rect)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    text_band = gray[:, int(crop.shape[1] * 0.08) : int(crop.shape[1] * 0.95)]
+    row_projection = np.sum(text_band < 150, axis=1).astype(np.float32)
+
+    kernel_size = max(7, int(crop.shape[0] * 0.025))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    smoothed = np.convolve(row_projection, np.ones(kernel_size) / kernel_size, mode="same")
+
+    threshold = max(5.0, text_band.shape[1] * 0.025)
+    min_distance = max(30, int(crop.shape[0] * 0.065))
+    edge_margin = int(crop.shape[0] * 0.04)
+    selected: list[int] = []
+    for raw_index in np.argsort(smoothed)[::-1]:
+        index = int(raw_index)
+        if smoothed[index] < threshold:
+            break
+        if index < edge_margin or index > crop.shape[0] - edge_margin:
+            continue
+        if all(abs(index - existing) >= min_distance for existing in selected):
+            selected.append(index)
+
+    selected.sort()
+    return [crop_rect.top + index + ctx.screen_origin[1] for index in selected]
+
+
+def fallback_click_recognize_menu(image: np.ndarray, menu_rect: Rect) -> bool:
     ctx = require_ctx()
     if menu_rect.height < 110 or menu_rect.width < 90:
         return False
+    row_centers = menu_row_centers(image, menu_rect)
+    if len(row_centers) < 8:
+        log(f"[WARN] 右键菜单只检测到 {len(row_centers)} 行，拒绝按行位置点击。")
+        return False
     x = menu_rect.left + int(menu_rect.width * 0.55)
-    # WeChat image viewer context menu places "识别图中二维码" below
-    # "定位到聊天位置" and above "使用系统默认方式打开".
-    y = menu_rect.top + int(menu_rect.height * 0.68)
+    # The QR-recognition item is followed by "open with system default"
+    # and "save as", so it is the third visible row from the bottom.
+    y = row_centers[-3]
     if ctx.dry_run:
-        log(f"[DRY-RUN] would click fallback recognize menu row at ({x}, {y}), menu={menu_rect}")
+        log(
+            f"[DRY-RUN] would click fallback recognize menu row at ({x}, {y}), "
+            f"menu={menu_rect}, rows={row_centers}"
+        )
         return True
     pyautogui.click(x, y)
-    log(f"[OK] 已使用菜单相对位置兜底点击：menu={menu_rect}, point=({x}, {y})")
+    log(f"[OK] 已按菜单行结构兜底点击：menu={menu_rect}, rows={row_centers}, point=({x}, {y})")
     return True
 
 
@@ -758,7 +754,7 @@ def click_recognize_qr_menu():
         menu_rect = synthetic_context_menu_rect(image, click_point)
     if menu_rect is None:
         fail("click_recognize_qr_menu", "右键菜单已截图，但无法定位“识别二维码”菜单区域。")
-    if not fallback_click_recognize_menu(menu_rect):
+    if not fallback_click_recognize_menu(image, menu_rect):
         fail("click_recognize_qr_menu", f"右键菜单区域不满足兜底点击条件：{menu_rect}")
 
     time.sleep(4.0)
@@ -779,10 +775,10 @@ def candidate_target_window_rect() -> Rect:
     return Rect(ox, oy, ox + full.shape[1], oy + full.shape[0])
 
 
-def orange_submit_candidates(image: np.ndarray, target_rect: Rect) -> list[Detection]:
+def orange_button_candidates(image: np.ndarray, target_rect: Rect) -> list[Detection]:
     crop, crop_rect = crop_by_rect(image, target_rect)
     h, w = crop.shape[:2]
-    search_local = Rect(int(w * 0.48), int(h * 0.70), w - 8, h - 8)
+    search_local = Rect(int(w * 0.12), int(h * 0.55), w - 8, h - 8)
     search = crop[search_local.top : search_local.bottom, search_local.left : search_local.right]
     hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
     lower1 = np.array([0, 70, 120])
@@ -815,21 +811,56 @@ def orange_submit_candidates(image: np.ndarray, target_rect: Rect) -> list[Detec
     return detections
 
 
+def submit_button_candidates(image: np.ndarray, target_rect: Rect) -> list[Detection]:
+    min_x = target_rect.left + int(target_rect.width * 0.55)
+    min_y = target_rect.top + int(target_rect.height * 0.88)
+    return [
+        detection
+        for detection in orange_button_candidates(image, target_rect)
+        if detection.center[0] >= min_x and detection.center[1] >= min_y
+    ]
+
+
+def notice_dialog_candidate(image: np.ndarray, target_rect: Rect) -> Detection | None:
+    min_y = target_rect.top + int(target_rect.height * 0.68)
+    max_y = target_rect.top + int(target_rect.height * 0.88)
+    max_center_offset = target_rect.width * 0.18
+    min_width = target_rect.width * 0.30
+    candidates = [
+        detection
+        for detection in orange_button_candidates(image, target_rect)
+        if min_y <= detection.center[1] < max_y
+        and detection.bbox.width >= min_width
+        and abs(detection.center[0] - target_rect.center[0]) <= max_center_offset
+    ]
+    return candidates[0] if candidates else None
+
+
 def wait_for_miniprogram_page():
     ctx = require_ctx()
     deadline = time.time() + ctx.max_wait
     best: Detection | None = None
     best_image: np.ndarray | None = None
+    notice_dismissed = False
     while time.time() < deadline:
         image = capture_fullscreen_bgr()
         target_rect = candidate_target_window_rect()
-        candidates = orange_submit_candidates(image, target_rect)
+        candidates = submit_button_candidates(image, target_rect)
         if candidates:
             best = candidates[0]
             best_image = image
             save_debug_image(image, "miniprogram_page", [best])
             log("[OK] 检测到小程序页面候选橙色提交区域。")
             return
+        if not notice_dismissed:
+            notice = notice_dialog_candidate(image, target_rect)
+            if notice is not None:
+                save_debug_image(image, "miniprogram_page", [notice])
+                pyautogui.click(notice.center[0], notice.center[1])
+                notice_dismissed = True
+                log(f"[OK] 已关闭须知弹窗：center={notice.center}")
+                time.sleep(1.0)
+                continue
         best_image = image
         time.sleep(1.0)
 
@@ -842,7 +873,7 @@ def detect_submit_button() -> tuple[Rect, tuple[int, int]]:
     ctx = require_ctx()
     image = capture_fullscreen_bgr()
     target_rect = candidate_target_window_rect()
-    candidates = orange_submit_candidates(image, target_rect)
+    candidates = submit_button_candidates(image, target_rect)
     if not candidates:
         save_debug_image(image, "submit_button")
         fail("detect_submit_button", "未在页面底部右侧检测到橙色“提交订单”按钮候选。")
@@ -872,8 +903,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Windows 微信小程序抢票提交订单自动化助手")
     parser.add_argument("--chat-name", default="swim", help="目标聊天名称，默认 swim")
     parser.add_argument("--debug-dir", default="./debug", help="debug 截图目录，默认 ./debug")
+    parser.add_argument(
+        "--debug-mode",
+        choices=("all", "failure"),
+        default="all",
+        help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 all",
+    )
     parser.add_argument("--no-ocr", action="store_true", default=True, help="兼容参数：默认不依赖 OCR")
-    parser.add_argument("--max-wait", type=int, default=10, help="等待小程序页面最长秒数，默认 10")
+    parser.add_argument("--max-wait", type=int, default=20, help="等待小程序页面最长秒数，默认 20")
     parser.add_argument("--dry-run", action="store_true", help="只检测，不执行鼠标/键盘点击")
     return parser.parse_args(argv)
 
@@ -886,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
     CTX = Context(
         chat_name=args.chat_name,
         debug_dir=Path(args.debug_dir).resolve(),
+        debug_mode=args.debug_mode,
         no_ocr=args.no_ocr,
         max_wait=max(1, args.max_wait),
         dry_run=args.dry_run,
@@ -911,14 +949,16 @@ def main(argv: list[str] | None = None) -> int:
     except StepFailure as exc:
         log(f"[FAIL] step={exc.step}")
         log(f"[FAIL] reason={exc.reason}")
-        if CTX and CTX.last_debug_path:
-            log(f"[FAIL] debug={CTX.last_debug_path}")
+        debug_path = persist_failure_debug(exc.step)
+        if debug_path:
+            log(f"[FAIL] debug={debug_path}")
         return 1
     except Exception as exc:
         log(f"[FAIL] step=unexpected")
         log(f"[FAIL] reason={exc}")
-        if CTX and CTX.last_debug_path:
-            log(f"[FAIL] debug={CTX.last_debug_path}")
+        debug_path = persist_failure_debug("unexpected")
+        if debug_path:
+            log(f"[FAIL] debug={debug_path}")
         return 1
 
 

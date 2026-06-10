@@ -23,17 +23,24 @@ uv run python main.py --chat-name "swim" --dry-run
 uv run python main.py --chat-name "swim"
 ```
 
+当前默认等同于完整调试模式：
+
+```powershell
+uv run python main.py --chat-name "swim" --debug-mode all
+```
+
 可选参数：
 
 - `--chat-name`：目标聊天名称，默认 `swim`
 - `--debug-dir`：debug 截图目录，默认 `./debug`
+- `--debug-mode`：`all` 保存全部过程图，`failure` 仅失败保存最后截图；当前默认 `all`
 - `--no-ocr`：兼容参数，默认不依赖 OCR
-- `--max-wait`：等待小程序页面最长秒数，默认 `10`
+- `--max-wait`：等待小程序页面最长秒数，默认 `20`
 - `--dry-run`：只检测，不执行鼠标/键盘点击
 
 ## Debug 截图
 
-脚本会保存以下截图：
+`--debug-mode all` 会保存完整过程截图：
 
 - `debug/debug_01_wechat_found.png`
 - `debug/debug_02_swim_chat.png`
@@ -45,7 +52,11 @@ uv run python main.py --chat-name "swim"
 - `debug/debug_08_submit_button.png`
 - `debug/debug_09_after_click.png`
 
-任一步失败会输出失败步骤、原因和最近一张 debug 截图路径，然后立即退出。
+`--debug-mode failure` 仅在失败时保存最后一张可用截图：
+
+- `debug/debug_failure_<step>.png`
+
+任一步失败会输出失败步骤、原因和对应截图路径，然后立即退出。
 
 ## 行为限制
 
