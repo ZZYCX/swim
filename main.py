@@ -52,7 +52,12 @@ DEBUG_NAMES = {
     "miniprogram_page": "debug_07_miniprogram_page.png",
     "submit_button": "debug_08_submit_button.png",
     "after_click": "debug_09_after_click.png",
+    "order_page": "debug_10_order_page.png",
+    "final_submit_button": "debug_11_final_submit_button.png",
+    "after_final_submit": "debug_12_after_final_submit.png",
 }
+
+ORDER_PAGE_MARKERS = {"订单页面", "订单明细", "订单信息"}
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,7 @@ class Context:
     last_debug_key: str | None = None
     link_detection: Detection | None = None
     submit_detection: Detection | None = None
+    final_submit_detection: Detection | None = None
 
 
 class StepFailure(RuntimeError):
@@ -764,6 +770,117 @@ def click_submit_once(button_center: tuple[int, int]) -> None:
     log("[DONE] 已点击一次“提交订单”。")
 
 
+def find_visible_miniprogram_uia() -> tuple[object, Rect] | None:
+    ctx = require_ctx()
+    for window in gw.getAllWindows():
+        if "奥冠体育" not in safe_window_title(window).strip():
+            continue
+        handle = getattr(window, "_hWnd", None)
+        if not handle:
+            continue
+        try:
+            if not ctypes.windll.user32.IsWindowVisible(handle):
+                continue
+            if ctypes.windll.user32.IsIconic(handle):
+                continue
+        except Exception:
+            pass
+
+        rect = to_rect_from_pygetwindow(window)
+        if rect.width < 300 or rect.height < 300:
+            continue
+        try:
+            uia_window = connect_uia_window(window)
+        except Exception:
+            continue
+        if uia_window is None:
+            continue
+
+        ctx.miniprogram_rect = rect
+        return uia_window, rect
+    return None
+
+
+def visible_order_page_marker(uia_window: object, window_rect: Rect) -> str | None:
+    try:
+        elements = uia_window.descendants()
+    except Exception:
+        return None
+
+    for element in elements:
+        name = element_name(element).strip()
+        if name not in ORDER_PAGE_MARKERS:
+            continue
+        rect = element_rect(element)
+        if rect is None or rect.width <= 0 or rect.height <= 0:
+            continue
+        if not point_inside(rect, window_rect):
+            continue
+        try:
+            if not element.is_visible():
+                continue
+        except Exception:
+            continue
+        return name
+    return None
+
+
+def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
+    ctx = require_ctx()
+    deadline = time.time() + ctx.max_wait
+    order_page_logged = False
+    last_image: np.ndarray | None = None
+
+    while time.time() < deadline:
+        target = find_visible_miniprogram_uia()
+        if target is not None:
+            uia_window, target_rect = target
+            marker = visible_order_page_marker(uia_window, target_rect)
+            if marker is not None:
+                image = capture_fullscreen_bgr()
+                last_image = image
+                if not order_page_logged:
+                    save_debug_image(image, "order_page")
+                    log(f"[OK] UIA 检测到订单页标志：{marker}")
+                    order_page_logged = True
+
+                candidates = submit_button_candidates(image, target_rect)
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    detection = Detection(
+                        candidate.bbox,
+                        candidate.center,
+                        candidate.score,
+                        "final-submit",
+                    )
+                    ctx.final_submit_detection = detection
+                    save_debug_image(image, "final_submit_button", [detection])
+                    log(
+                        "[OK] 定位最终提交按钮："
+                        f"bbox={detection.bbox}, center={detection.center}, "
+                        f"score={detection.score:.3f}"
+                    )
+                    return detection.bbox, detection.center
+
+        remaining = deadline - time.time()
+        if remaining > 0:
+            time.sleep(min(2.0, remaining))
+
+    if last_image is not None:
+        save_debug_image(last_image, "final_submit_button")
+    fail(
+        "wait_for_final_submit_button",
+        f"{ctx.max_wait} 秒内未同时确认订单页 UIA 标志和唯一的右下角橙色提交按钮。",
+    )
+
+
+def click_final_submit_once(button_center: tuple[int, int]) -> None:
+    pyautogui.click(*button_center)
+    time.sleep(1.0)
+    screenshot_fullscreen("after_final_submit")
+    log("[DONE] 已点击一次最终“提交”。")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Windows 微信小程序抢票提交订单自动化助手")
     parser.add_argument("--chat-name", default="swim", help="目标聊天名称，默认 swim")
@@ -771,7 +888,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--debug-mode",
         choices=("all", "failure"),
-        default="failure",
+        default="all",
         help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 failure",
     )
     parser.add_argument("--max-wait", type=int, default=20, help="等待小程序页面最长秒数，默认 20")
@@ -798,16 +915,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     CTX.debug_dir.mkdir(parents=True, exist_ok=True)
 
-    today = date.today()
-    weekday = today.isoweekday()
-    next_weekday = weekday % 7 + 1
-    link = miniprogram_url_for_date(today)
-    log(
-        f"[INFO] 当前日期={today.isoformat()}，当前={WEEKDAY_NAMES[weekday]}，"
-        f"选择次日={WEEKDAY_NAMES[next_weekday]}，链接={link}"
-    )
-
     try:
+        today = date.today()
+        weekday = today.isoweekday()
+        next_weekday = weekday % 7 + 1
+        link = miniprogram_url_for_date(today)
+        log(
+            f"[INFO] 当前日期={today.isoformat()}，当前={WEEKDAY_NAMES[weekday]}，"
+            f"选择次日={WEEKDAY_NAMES[next_weekday]}，链接={link}"
+        )
+
         find_wechat_window()
         screenshot_fullscreen("wechat_found")
         open_swim_chat()
@@ -822,6 +939,8 @@ def main(argv: list[str] | None = None) -> int:
         wait_for_miniprogram_page()
         _, button_center = detect_submit_button()
         click_submit_once(button_center)
+        _, final_button_center = wait_for_final_submit_button()
+        click_final_submit_once(final_button_center)
         return 0
     except StepFailure as exc:
         log(f"[FAIL] step={exc.step}")
