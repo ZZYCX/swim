@@ -55,6 +55,10 @@ DEBUG_NAMES = {
     "order_page": "debug_10_order_page.png",
     "final_submit_button": "debug_11_final_submit_button.png",
     "after_final_submit": "debug_12_after_final_submit.png",
+    "retry_notice": "debug_retry_notice.png",
+    "retry_submit_button": "debug_retry_submit_button.png",
+    "retry_page": "debug_retry_page.png",
+    "retry_timeout": "debug_retry_timeout.png",
 }
 
 ORDER_PAGE_MARKERS = {"订单页面", "订单明细", "订单信息"}
@@ -830,18 +834,28 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
     deadline = time.time() + ctx.max_wait
     order_page_logged = False
     last_image: np.ndarray | None = None
+    retry_round = 0
+    notice_dismiss_count = 0
+    retry_submit_count = 0
+    last_state = "等待页面稳定"
 
     while time.time() < deadline:
+        retry_round += 1
         target = find_visible_miniprogram_uia()
+        target_rect: Rect | None = None
         if target is not None:
             uia_window, target_rect = target
             marker = visible_order_page_marker(uia_window, target_rect)
             if marker is not None:
+                last_state = f"订单页({marker})"
                 image = capture_fullscreen_bgr()
                 last_image = image
                 if not order_page_logged:
                     save_debug_image(image, "order_page")
-                    log(f"[OK] UIA 检测到订单页标志：{marker}")
+                    log(
+                        f"[OK] 第 {retry_round} 轮检测到订单页标志：{marker}；"
+                        f"再次提交次数={retry_submit_count}，关闭弹窗次数={notice_dismiss_count}"
+                    )
                     order_page_logged = True
 
                 candidates = submit_button_candidates(image, target_rect)
@@ -862,15 +876,74 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
                     )
                     return detection.bbox, detection.center
 
+                log(
+                    f"[WAIT] 第 {retry_round} 轮已确认订单页，"
+                    f"最终提交按钮候选数={len(candidates)}，继续等待。"
+                )
+                remaining = deadline - time.time()
+                if remaining > 0:
+                    time.sleep(min(1.0, remaining))
+                continue
+
+        image = capture_fullscreen_bgr()
+        last_image = image
+        if target_rect is None:
+            target_rect = candidate_target_window_rect()
+
+        notice = notice_dialog_candidate(image, target_rect)
+        if notice is not None:
+            notice_dismiss_count += 1
+            last_state = "抢票页须知弹窗"
+            save_debug_image(image, "retry_notice", [notice])
+            pyautogui.click(*notice.center)
+            log(
+                f"[RETRY] 第 {retry_round} 轮检测到须知弹窗并关闭："
+                f"center={notice.center}，关闭次数={notice_dismiss_count}"
+            )
+            remaining = deadline - time.time()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+            continue
+
+        candidates = submit_button_candidates(image, target_rect)
+        if candidates:
+            detection = candidates[0]
+            retry_submit_count += 1
+            last_state = "抢票页提交订单"
+            ctx.submit_detection = None
+            ctx.submit_detection = detection
+            save_debug_image(image, "retry_submit_button", [detection])
+            log(
+                f"[RETRY] 第 {retry_round} 轮仍处于抢票页，"
+                f"第 {retry_submit_count} 次再次点击“提交订单”："
+                f"bbox={detection.bbox}, center={detection.center}, score={detection.score:.3f}"
+            )
+            pyautogui.click(*detection.center)
+            remaining = deadline - time.time()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+            continue
+
+        last_state = "未识别到订单页、须知弹窗或抢票提交按钮"
+        save_debug_image(image, "retry_page")
+        log(f"[WAIT] 第 {retry_round} 轮页面状态未确认，未执行点击。")
+
         remaining = deadline - time.time()
         if remaining > 0:
-            time.sleep(min(2.0, remaining))
+            time.sleep(min(1.0, remaining))
 
     if last_image is not None:
-        save_debug_image(last_image, "final_submit_button")
+        save_debug_image(last_image, "retry_timeout")
+    log(
+        f"[FAIL] 首次提交后页面判断超时：轮询次数={retry_round}，"
+        f"再次提交次数={retry_submit_count}，关闭弹窗次数={notice_dismiss_count}，"
+        f"最后状态={last_state}"
+    )
     fail(
         "wait_for_final_submit_button",
-        f"{ctx.max_wait} 秒内未同时确认订单页 UIA 标志和唯一的右下角橙色提交按钮。",
+        f"首次提交后 {ctx.max_wait} 秒内未进入可提交的订单页；"
+        f"再次提交次数={retry_submit_count}，关闭弹窗次数={notice_dismiss_count}，"
+        f"最后状态={last_state}。",
     )
 
 
@@ -888,10 +961,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--debug-mode",
         choices=("all", "failure"),
-        default="all",
+        default="failure",
         help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 failure",
     )
-    parser.add_argument("--max-wait", type=int, default=20, help="等待小程序页面最长秒数，默认 20")
+    parser.add_argument(
+        "--max-wait",
+        type=int,
+        default=20,
+        help="等待小程序页面及首次提交后重试阶段的单阶段最长秒数，默认 20",
+    )
     parser.add_argument("--dry-run", action="store_true", help="只验证微信、聊天和次日链接，不发送或点击")
     parser.add_argument("--startup-probe", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(argv)
