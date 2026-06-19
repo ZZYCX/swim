@@ -103,7 +103,8 @@ powershell -ExecutionPolicy Bypass -File .\install_scheduled_task.ps1 -TargetTim
 10. 点击链接进入小程序，关闭可能出现的须知弹窗，检测并首次点击“提交订单”。
 11. 首次提交后优先通过 UIA 检查订单页；若仍在抢票页，则按当前页面关闭须知弹窗或重新点击“提交订单”，总重试时间不超过 `--max-wait`。
 12. 确认进入订单页后检测并单次点击右下角最终“提交”。
-13. `scheduler.py` 记录正式进程启动时间、首条 `main.py` 日志相对目标时间的偏差和最终退出码。
+13. 最终提交后尝试通过 UIA 关闭微信主窗口；UIA 失败时使用窗口 `close()` 兜底，关闭失败不影响抢票退出码。
+14. `scheduler.py` 记录正式进程启动时间、首条 `main.py` 日志相对目标时间的偏差和最终退出码。
 
 ## TargetTime 说明
 

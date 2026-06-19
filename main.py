@@ -62,6 +62,7 @@ DEBUG_NAMES = {
 }
 
 ORDER_PAGE_MARKERS = {"订单页面", "订单明细", "订单信息"}
+FINAL_SUBMIT_DELAY_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -833,6 +834,7 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
     ctx = require_ctx()
     deadline = time.time() + ctx.max_wait
     order_page_logged = False
+    order_page_seen_at: float | None = None
     last_image: np.ndarray | None = None
     retry_round = 0
     notice_dismiss_count = 0
@@ -848,6 +850,10 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
             marker = visible_order_page_marker(uia_window, target_rect)
             if marker is not None:
                 last_state = f"订单页({marker})"
+                now = time.time()
+                if order_page_seen_at is None:
+                    order_page_seen_at = now
+                    deadline = max(deadline, order_page_seen_at + FINAL_SUBMIT_DELAY_SECONDS + 1.0)
                 image = capture_fullscreen_bgr()
                 last_image = image
                 if not order_page_logged:
@@ -857,6 +863,16 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
                         f"再次提交次数={retry_submit_count}，关闭弹窗次数={notice_dismiss_count}"
                     )
                     order_page_logged = True
+
+                wait_seconds = FINAL_SUBMIT_DELAY_SECONDS - (now - order_page_seen_at)
+                if wait_seconds > 0:
+                    log(
+                        f"[WAIT] 已进入订单页，等待 {wait_seconds:.1f} 秒后再点击最终“提交”。"
+                    )
+                    remaining = deadline - time.time()
+                    if remaining > 0:
+                        time.sleep(min(1.0, wait_seconds, remaining))
+                    continue
 
                 candidates = submit_button_candidates(image, target_rect)
                 if len(candidates) == 1:
@@ -954,6 +970,212 @@ def click_final_submit_once(button_center: tuple[int, int]) -> None:
     log("[DONE] 已点击一次最终“提交”。")
 
 
+def detect_visible_order_page_submit_button() -> tuple[Detection | None, int]:
+    ctx = require_ctx()
+    target = find_visible_miniprogram_uia()
+    if target is None:
+        return None, 0
+
+    uia_window, target_rect = target
+    marker = visible_order_page_marker(uia_window, target_rect)
+    if marker is None:
+        return None, 0
+
+    image = capture_fullscreen_bgr()
+    candidates = submit_button_candidates(image, target_rect)
+    if len(candidates) != 1:
+        return None, len(candidates)
+
+    candidate = candidates[0]
+    detection = Detection(
+        candidate.bbox,
+        candidate.center,
+        candidate.score,
+        "final-submit",
+    )
+    ctx.final_submit_detection = detection
+    return detection, len(candidates)
+
+
+def confirm_final_submit_completed() -> None:
+    ctx = require_ctx()
+    deadline = time.time() + ctx.max_wait
+    retry_count = 0
+    check_round = 0
+    last_candidate_count = 0
+
+    while time.time() < deadline:
+        check_round += 1
+        detection, candidate_count = detect_visible_order_page_submit_button()
+        last_candidate_count = candidate_count
+
+        if detection is None:
+            if candidate_count == 0:
+                log(
+                    f"[OK] 最终提交后未检测到订单页“提交”按钮，"
+                    f"确认可关闭微信；复点次数={retry_count}"
+                )
+                return
+
+            log(
+                f"[WAIT] 第 {check_round} 轮最终提交确认："
+                f"订单页提交按钮候选数={candidate_count}，继续等待。"
+            )
+        else:
+            retry_count += 1
+            log(
+                f"[RETRY] 第 {check_round} 轮最终提交确认仍检测到订单页“提交”按钮，"
+                f"第 {retry_count} 次再次点击："
+                f"bbox={detection.bbox}, center={detection.center}, score={detection.score:.3f}"
+            )
+            pyautogui.click(*detection.center)
+            time.sleep(1.0)
+            screenshot_fullscreen("after_final_submit")
+
+        remaining = deadline - time.time()
+        if remaining > 0:
+            time.sleep(min(1.0, remaining))
+
+    fail(
+        "confirm_final_submit_completed",
+        f"最终提交后 {ctx.max_wait} 秒内未确认订单页“提交”按钮消失；"
+        f"再次点击次数={retry_count}，最后候选数={last_candidate_count}。",
+    )
+
+
+def wechat_window_closed_or_hidden(window: object) -> bool:
+    handle = getattr(window, "_hWnd", None)
+    if handle:
+        try:
+            if not ctypes.windll.user32.IsWindow(handle):
+                return True
+            if not ctypes.windll.user32.IsWindowVisible(handle):
+                return True
+            if ctypes.windll.user32.IsIconic(handle):
+                return True
+        except Exception:
+            pass
+
+    try:
+        if getattr(window, "isMinimized", False):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def locate_wechat_close_button(uia_window: object, window_rect: Rect) -> object | None:
+    try:
+        elements = uia_window.descendants()
+    except Exception as exc:
+        log(f"[WARN] 读取微信关闭按钮 UIA 元素失败：{exc}")
+        return None
+
+    right_band_left = window_rect.right - max(140, int(window_rect.width * 0.08))
+    title_bottom = window_rect.top + max(70, int(window_rect.height * 0.08))
+    candidates = []
+    for element in elements:
+        if element_control_type(element) != "Button":
+            continue
+        name = element_name(element).strip()
+        normalized = name.lower()
+        if "关闭" not in name and "close" not in normalized:
+            continue
+        rect = element_rect(element)
+        if rect is None or rect.width <= 0 or rect.height <= 0:
+            continue
+        cx, cy = rect.center
+        if cx < right_band_left or cy > title_bottom:
+            continue
+        candidates.append((rect, element, name))
+
+    if not candidates:
+        return None
+
+    rect, element, name = max(candidates, key=lambda item: (item[0].center[0], -item[0].center[1]))
+    log(f"[OK] 定位微信窗口关闭按钮：name={name!r}, rect={rect}")
+    return element
+
+
+def invoke_uia_button(element: object) -> None:
+    try:
+        element.invoke()
+        return
+    except Exception as exc:
+        invoke_error = exc
+
+    try:
+        element.iface_invoke.Invoke()
+        return
+    except Exception as exc:
+        raise invoke_error from exc
+
+
+def close_wechat_window_after_final_submit() -> None:
+    ctx = require_ctx()
+    window = ctx.wechat_window
+    if window is None:
+        log("[WARN] 缺少微信窗口对象，跳过最终提交后的微信关闭。")
+        return
+
+    window_rect = ctx.wechat_rect or to_rect_from_pygetwindow(window)
+    uia_window = ctx.wechat_uia
+    close_button = None
+
+    for attempt in range(2):
+        if uia_window is not None:
+            close_button = locate_wechat_close_button(uia_window, window_rect)
+        if close_button is not None:
+            break
+        if attempt == 0:
+            try:
+                uia_window = connect_uia_window(window)
+                ctx.wechat_uia = uia_window
+            except Exception as exc:
+                log(f"[WARN] 重新连接微信 UIA 失败：{exc}")
+                uia_window = None
+
+    if close_button is not None:
+        try:
+            invoke_uia_button(close_button)
+            time.sleep(0.8)
+            if wechat_window_closed_or_hidden(window):
+                log("[OK] 已通过 UIA 关闭微信主窗口。")
+                return
+            log("[WARN] 已 Invoke 微信关闭按钮，但窗口仍可见，将使用窗口 close() 兜底。")
+        except Exception as exc:
+            log(f"[WARN] UIA 关闭微信主窗口失败，将使用窗口 close() 兜底：{exc}")
+    else:
+        log("[WARN] 未通过 UIA 找到微信右上角关闭按钮，将使用窗口 close() 兜底。")
+
+    close_method = getattr(window, "close", None)
+    if not callable(close_method):
+        log("[WARN] 微信窗口对象不支持 close()，跳过最终提交后的微信关闭。")
+        return
+
+    try:
+        close_method()
+        time.sleep(0.8)
+        if wechat_window_closed_or_hidden(window):
+            log("[OK] 已通过窗口 close() 关闭微信主窗口。")
+        else:
+            log("[WARN] 已调用窗口 close()，但微信主窗口仍可见。")
+    except Exception as exc:
+        log(f"[WARN] 窗口 close() 关闭微信主窗口失败：{exc}")
+
+
+def close_wechat_window_before_failure_exit() -> None:
+    if CTX is None or CTX.wechat_window is None:
+        return
+
+    log("[INFO] 失败退出前尝试关闭微信主窗口。")
+    try:
+        close_wechat_window_after_final_submit()
+    except Exception as exc:
+        log(f"[WARN] 失败退出前关闭微信主窗口异常，继续按原失败退出：{exc}")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Windows 微信小程序抢票提交订单自动化助手")
     parser.add_argument("--chat-name", default="swim", help="目标聊天名称，默认 swim")
@@ -967,7 +1189,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-wait",
         type=int,
-        default=20,
+        default=30,
         help="等待小程序页面及首次提交后重试阶段的单阶段最长秒数，默认 20",
     )
     parser.add_argument("--dry-run", action="store_true", help="只验证微信、聊天和次日链接，不发送或点击")
@@ -1019,6 +1241,8 @@ def main(argv: list[str] | None = None) -> int:
         click_submit_once(button_center)
         _, final_button_center = wait_for_final_submit_button()
         click_final_submit_once(final_button_center)
+        confirm_final_submit_completed()
+        close_wechat_window_after_final_submit()
         return 0
     except StepFailure as exc:
         log(f"[FAIL] step={exc.step}")
@@ -1026,6 +1250,7 @@ def main(argv: list[str] | None = None) -> int:
         debug_path = persist_failure_debug(exc.step)
         if debug_path:
             log(f"[FAIL] debug={debug_path}")
+        close_wechat_window_before_failure_exit()
         return 1
     except Exception as exc:
         log("[FAIL] step=unexpected")
@@ -1033,6 +1258,7 @@ def main(argv: list[str] | None = None) -> int:
         debug_path = persist_failure_debug("unexpected")
         if debug_path:
             log(f"[FAIL] debug={debug_path}")
+        close_wechat_window_before_failure_exit()
         return 1
 
 
