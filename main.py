@@ -22,6 +22,7 @@ pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.08
 
 
+# 按预约日的 ISO 星期编号映射：1=周一，7=周日；链接末尾不包含反斜杠。
 MINIPROGRAM_URLS = {
     1: "#小程序://奥冠体育/E3fnVdNHbsY1uiv",
     2: "#小程序://奥冠体育/PLaOWaqqLhsMcWi",
@@ -185,6 +186,7 @@ def miniprogram_url_for_weekday(weekday: int) -> str:
 
 
 def miniprogram_url_for_date(value: date) -> str:
+    """按运行日期选择次日的预约链接；周日运行时选择周一链接。"""
     next_weekday = value.isoweekday() % 7 + 1
     return miniprogram_url_for_weekday(next_weekday)
 
@@ -655,7 +657,8 @@ def candidate_target_window_rect() -> Rect:
 def orange_button_candidates(image: np.ndarray, target_rect: Rect) -> list[Detection]:
     crop, crop_rect = crop_by_rect(image, target_rect)
     height, width = crop.shape[:2]
-    search_local = Rect(int(width * 0.12), int(height * 0.55), width - 8, height - 8)
+    # 中部弹窗的橙色确认按钮也需要完整纳入搜索区域。
+    search_local = Rect(int(width * 0.12), int(height * 0.45), width - 8, height - 8)
     search = crop[search_local.top : search_local.bottom, search_local.left : search_local.right]
     hsv = cv2.cvtColor(search, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, np.array([0, 70, 120]), np.array([28, 255, 255]))
@@ -699,7 +702,8 @@ def submit_button_candidates(image: np.ndarray, target_rect: Rect) -> list[Detec
 
 
 def notice_dialog_candidate(image: np.ndarray, target_rect: Rect) -> Detection | None:
-    min_y = target_rect.top + int(target_rect.height * 0.68)
+    """按位置和颜色识别弹窗确认按钮，不区分弹窗文字含义。"""
+    min_y = target_rect.top + int(target_rect.height * 0.45)
     max_y = target_rect.top + int(target_rect.height * 0.88)
     max_center_offset = target_rect.width * 0.18
     min_width = target_rect.width * 0.30
@@ -727,7 +731,7 @@ def wait_for_miniprogram_page() -> None:
                 save_debug_image(image, "miniprogram_page", [notice])
                 pyautogui.click(*notice.center)
                 notice_dismissed = True
-                log(f"[OK] 已关闭须知弹窗：center={notice.center}")
+                log(f"[OK] 已点击弹窗橙色确认按钮：center={notice.center}")
                 time.sleep(1.0)
                 continue
         candidates = submit_button_candidates(image, target_rect)
@@ -909,11 +913,11 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
         notice = notice_dialog_candidate(image, target_rect)
         if notice is not None:
             notice_dismiss_count += 1
-            last_state = "抢票页须知弹窗"
+            last_state = "抢票页确认弹窗"
             save_debug_image(image, "retry_notice", [notice])
             pyautogui.click(*notice.center)
             log(
-                f"[RETRY] 第 {retry_round} 轮检测到须知弹窗并关闭："
+                f"[RETRY] 第 {retry_round} 轮点击弹窗橙色确认按钮，继续重试："
                 f"center={notice.center}，关闭次数={notice_dismiss_count}"
             )
             remaining = deadline - time.time()
@@ -940,7 +944,7 @@ def wait_for_final_submit_button() -> tuple[Rect, tuple[int, int]]:
                 time.sleep(min(1.0, remaining))
             continue
 
-        last_state = "未识别到订单页、须知弹窗或抢票提交按钮"
+        last_state = "未识别到订单页、确认弹窗或抢票提交按钮"
         save_debug_image(image, "retry_page")
         log(f"[WAIT] 第 {retry_round} 轮页面状态未确认，未执行点击。")
 
@@ -1183,7 +1187,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--debug-mode",
         choices=("all", "failure"),
-        default="failure",
+        default="all",
         help="截图模式：all 保存全部过程图，failure 仅失败保存最后截图；默认 failure",
     )
     parser.add_argument(
